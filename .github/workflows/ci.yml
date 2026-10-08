@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Lint, testes e build
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: hcode
+          POSTGRES_PASSWORD: hcode
+          POSTGRES_DB: hcode_hub_test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U hcode -d hcode_hub_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://hcode:hcode@localhost:5433/hcode_hub_test?schema=public
+      TEST_DATABASE_URL: postgresql://hcode:hcode@localhost:5433/hcode_hub_test?schema=public
+      JWT_ACCESS_SECRET: ci-access-secret
+      JWT_REFRESH_SECRET: ci-refresh-secret
+      PAYMENT_WEBHOOK_SECRET: ci-webhook-secret
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: TypeCheck
+        run: npm run typecheck
+
+      - name: Migrations em banco limpo
+        run: npx prisma migrate deploy
+
+      - name: Schema Prisma sem drift em relação às migrations
+        run: |
+          PGPASSWORD=hcode psql -h localhost -p 5433 -U hcode -d postgres -c 'CREATE DATABASE hcode_hub_shadow'
+          npx prisma migrate diff \
+            --from-migrations prisma/migrations \
+            --to-schema-datamodel prisma/schema.prisma \
+            --shadow-database-url "postgresql://hcode:hcode@localhost:5433/hcode_hub_shadow?schema=public" \
+            --exit-code
+
+      - name: Testes unitários
+        run: npm test
+
+      - name: Testes de integração
+        run: npm run test:integration
+
+      - name: Testes E2E
+        run: npm run test:e2e
+
+      - name: Build
+        run: npm run build
+
+  docker:
+    name: Docker build
+    needs: quality
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: hcode-hub:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
